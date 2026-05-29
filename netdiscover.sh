@@ -264,58 +264,85 @@ done
 (( EXTRAS == 0 )) && info "Aucun port supplementaire trouve par le scan custom."
 
 # ====================================================================
-# 4. RÉCAPITULATIF DES PORTS OUVERTS PAR IP
+# 4. SCAN UDP (services courants exposes en UDP)
 # ====================================================================
-hdr "Recapitulatif des ports ouverts"
+# DNS, SNMP, NFS/RPC, NetBIOS, NTP, DHCP, TFTP, Kerberos, IKE/VPN...
+UDP_PIVOT="53,67,69,88,111,123,137,138,161,389,500,514,2049,5353,4500"
 
-# Noms lisibles des services
+hdr "Scan UDP (services courants)"
+info "Ports : $UDP_PIVOT"
+echo
+
+UDP_NORM=$(mktemp); UDP_GREP=$(mktemp)
+nmap -sU -T2 --min-rate 50 \
+     -p "$UDP_PIVOT" "${SORTED[@]}" \
+     -oN "$UDP_NORM" -oG "$UDP_GREP" >/dev/null 2>&1
+cat "$UDP_NORM"
+rm -f "$UDP_NORM"
+
+# Parser les ports UDP open ou open|filtered (les deux meritent attention)
+declare -A UDP_PORTS_BY_IP
+while IFS= read -r key; do
+  cip="${key%%:*}"; cport="${key##*:}"
+  UDP_PORTS_BY_IP["$cip"]+=" $cport"
+done < <(grep "^Host:" "$UDP_GREP" | awk '{
+  ip = $2
+  for (i=1; i<=NF; i++) {
+    if ($i ~ /open.*\/udp/) {
+      split($i, parts, "/")
+      gsub(/,/, "", parts[1])
+      gsub(/^[[:space:]]+/, "", parts[1])
+      if (parts[1] ~ /^[0-9]+$/) print ip ":" parts[1]
+    }
+  }
+}')
+rm -f "$UDP_GREP"
+
+# ====================================================================
+# 5. RECAPITULATIF + VERIFICATION DES SERVICES (par IP, fusionnes)
+#    Pour chaque IP :
+#      - ports TCP en vert
+#      - ports UDP en vert
+#      - nmap -sS/-sU -sV -O + scripts NSE
+#      - checks bash additionnels
+# ====================================================================
+hdr "Recapitulatif et verification des services"
+
+# --- Noms de services (TCP + UDP) ---
 declare -A SVC=(
-  [21]="FTP"         [22]="SSH"          [23]="Telnet"
-  [53]="DNS"         [80]="HTTP"         [139]="NetBIOS"
-  [389]="LDAP"       [443]="HTTPS"       [445]="SMB"
-  [1433]="MSSQL"     [2049]="NFS"        [3306]="MySQL/MariaDB"
-  [3389]="RDP"       [5432]="PostgreSQL" [5672]="RabbitMQ"
-  [5900]="VNC"       [6379]="Redis"      [8080]="HTTP-Alt"
-  [8443]="HTTPS-Alt" [9000]="S3/MinIO"   [9042]="Cassandra"
-  [9092]="Kafka"     [9200]="Elasticsearch" [9418]="Git"
+  [21]="FTP"          [22]="SSH"           [23]="Telnet"
+  [53]="DNS"          [67]="DHCP"          [69]="TFTP"
+  [80]="HTTP"         [88]="Kerberos"      [111]="RPC"
+  [123]="NTP"         [137]="NetBIOS-NS"   [138]="NetBIOS-DGM"
+  [139]="NetBIOS"     [161]="SNMP"         [389]="LDAP"
+  [443]="HTTPS"       [445]="SMB"          [500]="IKE/VPN"
+  [514]="Syslog"      [1433]="MSSQL"       [2049]="NFS"
+  [3306]="MySQL"      [3389]="RDP"         [4500]="IPsec-NAT"
+  [5353]="mDNS"       [5432]="PostgreSQL"  [5672]="RabbitMQ"
+  [5900]="VNC"        [6379]="Redis"       [8080]="HTTP-Alt"
+  [8443]="HTTPS-Alt"  [9000]="S3/MinIO"    [9042]="Cassandra"
+  [9092]="Kafka"      [9200]="Elasticsearch" [9418]="Git"
   [11211]="Memcached" [15672]="RabbitMQ-Mgmt" [27017]="MongoDB"
 )
 
-# Combiner NMAP_OPEN + CUSTOM_OPEN → ALL_OPEN, grouper par IP
-declare -A ALL_OPEN PORTS_BY_IP
+# --- Combiner NMAP_OPEN + CUSTOM_OPEN → grouper par IP ---
+declare -A PORTS_BY_IP
 for key in "${!NMAP_OPEN[@]}" "${!CUSTOM_OPEN[@]}"; do
-  ALL_OPEN["$key"]=1
   cip="${key%%:*}"; cport="${key##*:}"
   PORTS_BY_IP["$cip"]+=" $cport"
 done
 
-if (( ${#PORTS_BY_IP[@]} == 0 )); then
-  warn "Aucun port ouvert detecte."
-else
-  mapfile -t RECAP_IPS < <(printf '%s\n' "${!PORTS_BY_IP[@]}" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
-  for ip in "${RECAP_IPS[@]}"; do
-    mapfile -t ip_ports < <(printf '%s\n' ${PORTS_BY_IP[$ip]} | sort -u -n)
-    line=""
-    for p in "${ip_ports[@]}"; do
-      name="${SVC[$p]:-svc}"
-      line+="${C_GRN}${p}${C_RST}${C_DIM}/${name}${C_RST}  "
-    done
-    printf '  %s%-16s%s : %b\n' "$C_B" "$ip" "$C_RST" "$line"
-  done
-fi
+# --- Liste des IPs (TCP + UDP confondus) ---
+declare -A _all_ips
+for ip in "${!PORTS_BY_IP[@]}" "${!UDP_PORTS_BY_IP[@]}"; do _all_ips["$ip"]=1; done
+mapfile -t RECAP_IPS < <(printf '%s\n' "${!_all_ips[@]}" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+unset _all_ips
 
-# ====================================================================
-# 5. VERIFICATION DES SERVICES
-# ====================================================================
-hdr "Verification des services"
-
-if (( ${#PORTS_BY_IP[@]} == 0 )); then
-  warn "Aucun service a verifier."
-  hdr "Termine"; exit 0
+if (( ${#RECAP_IPS[@]} == 0 )); then
+  warn "Aucun service a verifier."; hdr "Termine"; exit 0
 fi
 
 # --- Helper : requete bidirectionnelle bash /dev/tcp ---
-# Usage : tcp_dialog IP PORT PAYLOAD [timeout]
 tcp_dialog() {
   local ip="$1" port="$2" payload="$3" to="${4:-2}"
   timeout "$to" bash -c "
@@ -327,8 +354,8 @@ tcp_dialog() {
   " 2>/dev/null
 }
 
-# --- Scripts NSE par port ---
-declare -A NSE=(
+# --- Scripts NSE TCP par port ---
+declare -A NSE_TCP=(
   [21]="ftp-anon,ftp-syst"
   [22]="ssh-hostkey"
   [53]="dns-recursion"
@@ -352,49 +379,91 @@ declare -A NSE=(
   [27017]="mongodb-info,mongodb-databases"
 )
 
+# --- Scripts NSE UDP par port ---
+declare -A NSE_UDP=(
+  [53]="dns-recursion,dns-zone-transfer"
+  [111]="rpcinfo"
+  [137]="nbstat"
+  [161]="snmp-info,snmp-sysdescr,snmp-interfaces,snmp-netstat"
+  [500]="ike-version"
+  [2049]="nfs-showmount"
+)
+
+# =================================================================
 for ip in "${RECAP_IPS[@]}"; do
-  mapfile -t ip_ports < <(printf '%s\n' ${PORTS_BY_IP[$ip]} | sort -u -n)
-  [[ ${#ip_ports[@]} -eq 0 ]] && continue
+  mapfile -t ip_tcp < <(printf '%s\n' ${PORTS_BY_IP[$ip]:-}     | sort -u -n | grep -v '^$')
+  mapfile -t ip_udp < <(printf '%s\n' ${UDP_PORTS_BY_IP[$ip]:-} | sort -u -n | grep -v '^$')
+  [[ ${#ip_tcp[@]} -eq 0 && ${#ip_udp[@]} -eq 0 ]] && continue
 
   printf '\n%s┌─[ %s ]%s\n' "$C_B$C_CYN" "$ip" "$C_RST"
 
-  ports_csv=$(printf '%s,' "${ip_ports[@]}" | sed 's/,$//')
+  # --- Ports TCP en vert ---
+  if [[ ${#ip_tcp[@]} -gt 0 ]]; then
+    line=""
+    for p in "${ip_tcp[@]}"; do
+      line+="${C_GRN}${p}${C_RST}${C_DIM}/TCP/${SVC[$p]:-?}${C_RST}  "
+    done
+    printf '  %sTCP%s : %b\n' "$C_B" "$C_RST" "$line"
+  fi
 
-  # Construire la liste des scripts NSE (sans doublons)
+  # --- Ports UDP en vert ---
+  if [[ ${#ip_udp[@]} -gt 0 ]]; then
+    line=""
+    for p in "${ip_udp[@]}"; do
+      line+="${C_GRN}${p}${C_RST}${C_DIM}/UDP/${SVC[$p]:-?}${C_RST}  "
+    done
+    printf '  %sUDP%s : %b\n' "$C_B" "$C_RST" "$line"
+  fi
+  echo
+
+  # --- Construction des specs de ports et scripts NSE ---
+  tcp_csv=$(printf '%s,' "${ip_tcp[@]}" | sed 's/,$//')
+  udp_csv=$(printf '%s,' "${ip_udp[@]}" | sed 's/,$//')
+
+  # Scripts TCP (sans doublons)
   declare -A _seen=()
-  scripts_list=""
-  for p in "${ip_ports[@]}"; do
-    s="${NSE[$p]:-}"
-    [[ -z "$s" ]] && continue
-    IFS=',' read -ra slist <<< "$s"
-    for sc in "${slist[@]}"; do
-      if [[ -z "${_seen[$sc]:-}" ]]; then
-        _seen["$sc"]=1
-        scripts_list+=",$sc"
-      fi
+  scripts=""
+  for p in "${ip_tcp[@]}"; do
+    s="${NSE_TCP[$p]:-}"; [[ -z "$s" ]] && continue
+    IFS=',' read -ra sl <<< "$s"
+    for sc in "${sl[@]}"; do
+      [[ -z "${_seen[$sc]:-}" ]] && { _seen["$sc"]=1; scripts+=",$sc"; }
     done
   done
-  scripts_list="${scripts_list#,}"
+  # Scripts UDP (sans doublons)
+  for p in "${ip_udp[@]}"; do
+    s="${NSE_UDP[$p]:-}"; [[ -z "$s" ]] && continue
+    IFS=',' read -ra sl <<< "$s"
+    for sc in "${sl[@]}"; do
+      [[ -z "${_seen[$sc]:-}" ]] && { _seen["$sc"]=1; scripts+=",$sc"; }
+    done
+  done
+  scripts="${scripts#,}"
   unset _seen
 
-  # nmap -sV -O + scripts NSE sur les seuls ports ouverts de cet hote
-  nmap_args="-sS -sV -O --osscan-guess -p $ports_csv"
-  [[ -n "$scripts_list" ]] && nmap_args+=" --script $scripts_list"
-  # pgsql-brute : limiter aux creds par defaut postgres/postgres uniquement
-  [[ "$scripts_list" == *"pgsql-brute"* ]] && \
-    nmap_args+=" --script-args brute.firstonly=true,pgsql-brute.userdb=/dev/null,brute.mode=user"
+  # --- Spec port nmap selon combinaison TCP/UDP ---
+  if [[ -n "$tcp_csv" && -n "$udp_csv" ]]; then
+    scan_flags="-sS -sU"; port_spec="-p T:${tcp_csv},U:${udp_csv}"
+  elif [[ -n "$tcp_csv" ]]; then
+    scan_flags="-sS";     port_spec="-p ${tcp_csv}"
+  else
+    scan_flags="-sU";     port_spec="-p ${udp_csv}"
+  fi
 
-  nmap $nmap_args "$ip" 2>/dev/null | grep -v "^$" | sed 's/^/  /'
+  nmap_cmd="nmap $scan_flags -sV -O --osscan-guess $port_spec"
+  [[ -n "$scripts" ]] && nmap_cmd+=" --script $scripts"
+  [[ "$scripts" == *"pgsql-brute"* ]] && nmap_cmd+=" --script-args brute.firstonly=true"
+  nmap_cmd+=" $ip"
+
+  $nmap_cmd 2>/dev/null | grep -v "^$" | sed 's/^/  /'
 
   # -----------------------------------------------------------------
-  # Checks additionnels par service (ce que nmap NSE ne couvre pas)
+  # Checks additionnels bash (services non couverts par NSE)
   # -----------------------------------------------------------------
-  for p in "${ip_ports[@]}"; do
+  for p in "${ip_tcp[@]}" "${ip_udp[@]}"; do
     case "$p" in
 
-      # --- Elasticsearch : acces sans auth, info cluster ---
-      9200)
-        info "  [Elasticsearch] Check acces sans auth..."
+      9200) # Elasticsearch : acces sans auth, index
         if have curl; then
           res=$(curl -sk --max-time 4 "http://$ip:9200/" 2>/dev/null)
         else
@@ -403,141 +472,84 @@ for ip in "${RECAP_IPS[@]}"; do
         if echo "$res" | grep -q '"cluster_name"'; then
           cluster=$(echo "$res" | grep -o '"cluster_name":"[^"]*"' | cut -d'"' -f4)
           version=$(echo "$res" | grep -o '"number":"[^"]*"'       | cut -d'"' -f4)
-          warn "  [!] ELASTICSEARCH sans auth ! cluster=$cluster version=$version"
-          # lister les index
-          if have curl; then
+          warn "  [!] ELASTICSEARCH sans auth ! cluster=$cluster  version=$version"
+          have curl && {
             indices=$(curl -sk --max-time 4 "http://$ip:9200/_cat/indices?v" 2>/dev/null | head -10)
-            [[ -n "$indices" ]] && printf '  Index detectes :\n%s\n' "$indices" | sed 's/^/    /'
-          fi
-        else
-          ok "  [Elasticsearch] Auth requise ou service non accessible sans creds."
+            [[ -n "$indices" ]] && printf '  Index :\n%s\n' "$indices" | sed 's/^/    /'
+          }
         fi
         ;;
 
-      # --- Redis : PING sans auth ---
-      6379)
-        info "  [Redis] Check acces sans auth..."
-        if have nc; then
-          res=$(printf "PING\r\n" | nc -w2 "$ip" 6379 2>/dev/null)
-        else
-          res=$(tcp_dialog "$ip" 6379 "PING\r\n")
-        fi
+      6379) # Redis : PING sans auth
+        if have nc; then res=$(printf "PING\r\n" | nc -w2 "$ip" 6379 2>/dev/null)
+        else             res=$(tcp_dialog "$ip" 6379 "PING\r\n"); fi
         if echo "$res" | grep -q "+PONG"; then
           warn "  [!] REDIS sans auth !"
-          # version + OS via INFO
           if have nc; then
-            info_res=$(printf "INFO server\r\n" | nc -w2 "$ip" 6379 2>/dev/null | \
-                       grep -E "^redis_version|^os:|^arch_bits|^tcp_port")
+            ifo=$(printf "INFO server\r\n" | nc -w2 "$ip" 6379 2>/dev/null | grep -E "^redis_version|^os:|^arch_bits")
           else
-            info_res=$(tcp_dialog "$ip" 6379 "INFO server\r\n" 3 | \
-                       grep -E "^redis_version|^os:|^arch_bits|^tcp_port")
+            ifo=$(tcp_dialog "$ip" 6379 "INFO server\r\n" 3 | grep -E "^redis_version|^os:|^arch_bits")
           fi
-          [[ -n "$info_res" ]] && echo "$info_res" | sed 's/^/    /'
-        else
-          ok "  [Redis] Auth requise."
+          [[ -n "$ifo" ]] && echo "$ifo" | sed 's/^/    /'
         fi
         ;;
 
-      # --- MongoDB : couvert par NSE mongodb-databases ---
-      # NSE mongodb-databases liste les DBs si pas d'auth -> deja fait ci-dessus
+      11211) # Memcached : stats sans auth
+        if have nc; then res=$(printf "stats\r\n" | nc -w2 "$ip" 11211 2>/dev/null | head -6)
+        else             res=$(tcp_dialog "$ip" 11211 "stats\r\n"); fi
+        if echo "$res" | grep -q "^STAT "; then
+          warn "  [!] MEMCACHED sans auth !"
+          echo "$res" | grep "^STAT " | head -5 | sed 's/^/    /'
+        fi
+        ;;
 
-      # --- S3 / MinIO : check endpoint ---
-      9000|9001)
-        info "  [S3/MinIO] Check endpoint sur port $p..."
+      9000|9001) # S3 / MinIO
         if have curl; then
           res=$(curl -sI --max-time 4 "http://$ip:$p/" 2>/dev/null)
           body=$(curl -sk --max-time 4 "http://$ip:$p/" 2>/dev/null)
           if echo "$res$body" | grep -qi "x-amz\|minio\|ListBucketResult"; then
-            warn "  [!] Endpoint S3/MinIO detecte sur $ip:$p"
-            # tenter de lister les buckets
-            buckets=$(curl -sk --max-time 4 "http://$ip:$p/" 2>/dev/null | \
-                      grep -oP '(?<=<Name>)[^<]+' | head -10)
-            [[ -n "$buckets" ]] && { info "  Buckets accessibles :"; echo "$buckets" | sed 's/^/    /'; }
-          else
-            ok "  [S3/MinIO] Pas de reponse S3-compatible (ou auth requise)."
+            warn "  [!] Endpoint S3/MinIO sur port $p !"
+            buckets=$(echo "$body" | grep -oP '(?<=<Name>)[^<]+' | head -10)
+            [[ -n "$buckets" ]] && { info "  Buckets :"; echo "$buckets" | sed 's/^/    /'; }
           fi
-        else
-          warn "  [S3/MinIO] curl absent, check HTTP impossible."
         fi
         ;;
 
-      # --- Git (protocole natif port 9418) ---
-      9418)
-        info "  [Git] Check protocole git natif (port 9418)..."
+      9418) # Git natif
         payload="$(printf '0015git-upload-pack /\000host=%s\000' "$ip")"
         res=$(tcp_dialog "$ip" 9418 "$payload" 3 | strings | head -5)
-        if [[ -n "$res" ]]; then
-          ok "  [Git] Service git natif repond :"
-          echo "$res" | sed 's/^/    /'
-        else
-          info "  [Git] Pas de reponse git natif sur port 9418."
-        fi
+        [[ -n "$res" ]] && { ok "  [Git] Service git natif repond :"; echo "$res" | sed 's/^/    /'; }
         ;;
 
-      # --- Git + S3 sur HTTP/HTTPS ---
-      80|443|8080|8443)
+      80|443|8080|8443) # Git HTTP/S + S3 headers
         scheme="http"; [[ "$p" == "443" || "$p" == "8443" ]] && scheme="https"
         base="$scheme://$ip:$p"
-
         if have curl; then
-          # .git expose
           code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 "$base/.git/HEAD" 2>/dev/null)
-          [[ "$code" == "200" ]] && \
-            warn "  [!] GIT: /.git/HEAD accessible sur $base -> repo potentiellement lisible !"
-
-          # GitLab
+          [[ "$code" == "200" ]] && warn "  [!] GIT: /.git/HEAD accessible sur $base !"
           gl=$(curl -sk --max-time 3 "$base/api/v4/version" 2>/dev/null)
-          echo "$gl" | grep -q '"version"' && ok "  [Git] GitLab detecte sur $base : $(echo "$gl" | grep -o '"version":"[^"]*"')"
-
-          # Gitea
+          echo "$gl" | grep -q '"version"' && ok "  [Git] GitLab sur $base : $(echo "$gl" | grep -o '"version":"[^"]*"')"
           gt=$(curl -sk --max-time 3 "$base/api/swagger" 2>/dev/null)
-          echo "$gt" | grep -qi "gitea" && ok "  [Git] Gitea detecte sur $base"
-
-          # Gogs
+          echo "$gt" | grep -qi "gitea" && ok "  [Git] Gitea sur $base"
           gg=$(curl -sk --max-time 3 "$base/api/v1/settings/api" 2>/dev/null)
-          echo "$gg" | grep -qi "gogs\|gitea" && ok "  [Git] Gogs/Gitea API detecte sur $base"
-
-          # GitHub Enterprise
+          echo "$gg" | grep -qi "gogs\|gitea" && ok "  [Git] Gogs sur $base"
           ghe=$(curl -sk --max-time 3 "$base/api/v3/meta" 2>/dev/null)
-          echo "$ghe" | grep -qi '"github_services_sha"\|"verifiable_password_authentication"' && \
-            ok "  [Git] GitHub Enterprise detecte sur $base"
-
-          # S3 sur HTTP standard
+          echo "$ghe" | grep -qi "verifiable_password_authentication" && ok "  [Git] GitHub Enterprise sur $base"
           s3h=$(curl -sI --max-time 3 "$base/" 2>/dev/null)
-          echo "$s3h" | grep -qi "x-amz\|minio" && \
-            warn "  [!] S3: Headers AWS/MinIO detectes sur $base"
-
-          # Elasticsearch sur port 80/8080 (rare mais possible)
+          echo "$s3h" | grep -qi "x-amz\|minio" && warn "  [!] Headers S3/MinIO sur $base"
           es=$(curl -sk --max-time 3 "$base/" 2>/dev/null)
-          echo "$es" | grep -q '"cluster_name"' && \
-            warn "  [!] Elasticsearch sans auth detecte sur $base !"
+          echo "$es" | grep -q '"cluster_name"' && warn "  [!] Elasticsearch sans auth sur $base !"
         fi
         ;;
 
-      # --- Memcached : stats sans auth ---
-      11211)
-        info "  [Memcached] Check acces sans auth..."
-        if have nc; then
-          res=$(printf "stats\r\n" | nc -w2 "$ip" 11211 2>/dev/null | head -5)
-        else
-          res=$(tcp_dialog "$ip" 11211 "stats\r\n")
-        fi
-        if echo "$res" | grep -q "^STAT "; then
-          warn "  [!] MEMCACHED sans auth ! Stats accessibles :"
-          echo "$res" | grep "^STAT " | head -6 | sed 's/^/    /'
-        else
-          ok "  [Memcached] Pas de reponse aux stats (ou auth requise)."
-        fi
-        ;;
-
-      # --- RabbitMQ management UI ---
-      15672)
-        info "  [RabbitMQ] Check interface management..."
-        if have curl; then
+      15672) # RabbitMQ management
+        have curl && {
           res=$(curl -sk --max-time 3 -u guest:guest "http://$ip:15672/api/overview" 2>/dev/null)
-          echo "$res" | grep -q '"rabbitmq_version"' && \
-            warn "  [!] RabbitMQ management accessible avec guest:guest !"
-        fi
+          echo "$res" | grep -q '"rabbitmq_version"' && warn "  [!] RabbitMQ management accessible avec guest:guest !"
+        }
+        ;;
+
+      161) # SNMP : couvert par NSE snmp-info/snmp-sysdescr ci-dessus
         ;;
 
     esac
