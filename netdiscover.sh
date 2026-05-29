@@ -397,6 +397,12 @@ for ip in "${RECAP_IPS[@]}"; do
 
   printf '\n%s┌─[ %s ]%s\n' "$C_B$C_CYN" "$ip" "$C_RST"
 
+  # --- Infos ARP / ping ---
+  mac="${ARP_MAC[$ip]:-—}"
+  arp_s=$([[ -n "${ARP_UP[$ip]:-}"  ]] && printf '%soui%s' "$C_GRN" "$C_RST" || printf '%snon%s' "$C_DIM" "$C_RST")
+  png_s=$([[ -n "${PING_UP[$ip]:-}" ]] && printf '%soui%s' "$C_GRN" "$C_RST" || printf '%snon%s' "$C_RED" "$C_RST")
+  printf '  MAC : %s%-19s%s  ARP : %b   PING : %b\n' "$C_B" "$mac" "$C_RST" "$arp_s" "$png_s"
+
   # --- Ports ouverts (un par ligne, en vert) ---
   for p in "${ip_tcp[@]}"; do
     printf '  %s%-6s%s tcp   %s%-16s%s  port ouvert\n' \
