@@ -1,393 +1,304 @@
-# netdiscover.sh — Reconnaissance réseau autonome en bash
+# netdiscover.sh — Reconnaissance réseau furtive orientée pivoting
 
-Script bash de **découverte réseau complète** et **scan de ports**, conçu pour fonctionner sans dépendances obligatoires et s'intégrer dans d'autres scripts (mode non-interactif par défaut).
+Script bash de reconnaissance réseau complet : découverte L2/ICMP, recherche de sous-réseaux, scan de ports sensibles (double méthode), vérification automatique des services, et récapitulatif final par IP.
+
+Conçu pour être couplé dans un autre script — **aucune option requise**, aucune interaction.
+
+> ⚠️ **Doit être lancé en root/sudo.** `nmap` est une dépendance obligatoire.
+
+---
 
 ## Fonctionnalités
 
-### 1️⃣ Découverte L2 (ARP) + Ping sweep
-- **Scan ARP** pour détecter les hôtes présents à la couche 2 (MAC address)
-  - Utilise `arp-scan` s'il est disponible (vrai scan ARP raw)
-  - Sinon : provoque la résolution ARP via tentatives TCP (hôtes firewallés détectés aussi)
-- **Ping sweep ICMP** pour voir qui répond à l'ICMP
-- **Tableau comparatif** : met en évidence les hôtes visibles en L2 mais ne répondant pas au ping (ICMP filtré/firewall)
+### 1 — Découverte L2 (ARP) + Ping sweep
 
-### 2️⃣ Découverte d'autres sous-réseaux
-- Lecture de la table de routage (`ip route`)
-- Voisins ARP détectés hors du réseau cible
+- **Scan ARP** pour détecter les hôtes présents à la couche 2 (adresse MAC)
+  - Utilise `arp-scan` s'il est disponible (scan ARP raw natif)
+  - Sinon : provoque la résolution ARP via tentatives TCP (fonctionne même sur les hôtes qui filtrent l'ICMP)
+- **Ping sweep ICMP** en parallèle sur toute la plage
+- **Tableau comparatif** : met en évidence les hôtes visibles en L2 mais silencieux au ping → machines firewallées
+
+### 2 — Découverte d'autres sous-réseaux
+
+- Table de routage complète (`ip route`)
+- Sous-réseaux directement routés hors du réseau courant
+- Voisins ARP appartenant à d'autres réseaux (cache noyau)
 - Traceroute vers la passerelle → révèle les routeurs intermédiaires
 
-### 3️⃣ Scan de ports
-- **Tous les ports** (`1-65535`) par défaut
-- **Furtif si possible** :
-  - Si `nmap` + root → **SYN scan `-sS -f`** (fragmentation) ← vraie furtivité
-  - Si `nmap` seul → connect-scan via nmap `-sT`
-  - Sinon → connect-scan bash `/dev/tcp` parallélisé (randomisé, timeouts courts)
-- Ports triés en résultat, sortie colorée (ou plain text si piped)
+### 3 — Scan de ports sensibles (double méthode)
+
+#### 3a — Scan nmap de masse (SYN furtif)
+Scan simultané de tous les hôtes découverts sur les ports pivoting :
+```
+nmap -sS -T2 --min-rate 50 --randomize-hosts -p PORTS <hotes>
+```
+
+#### 3b — Scan custom IP-by-IP
+Scan individuel de chaque hôte sur les mêmes ports.
+Peut détecter des ports manqués par le scan de masse (certains IDS/firewalls
+ne déclenchent qu'au-dessus d'un seuil de ports simultanés).
+Seuls les résultats **supplémentaires** (non détectés par le scan de masse) sont affichés.
+
+**Ports scannés (23 ports pivoting) :**
+
+| Port | Service | Port | Service |
+|------|---------|------|---------|
+| 21 | FTP | 1433 | MSSQL |
+| 22 | SSH | 2049 | NFS |
+| 23 | Telnet | 3306 | MySQL / MariaDB |
+| 53 | DNS | 3389 | RDP |
+| 80 | HTTP | 5432 | PostgreSQL |
+| 139 | NetBIOS-SMB | 5672 | RabbitMQ |
+| 389 | LDAP | 5900 | VNC |
+| 443 | HTTPS | 6379 | Redis |
+| 445 | SMB | 8080 / 8443 | HTTP alt |
+| 9042 | Cassandra | 9092 | Kafka |
+| 9200 | Elasticsearch | 11211 | Memcached |
+| 27017 | MongoDB | | |
+
+### 4 — Récapitulatif des ports ouverts
+
+Tableau synthétique : une ligne par IP avec tous ses ports ouverts (résultats nmap + custom fusionnés) :
+```
+  192.168.1.1   : 22/SSH  80/HTTP  445/SMB  3306/MySQL
+  192.168.1.50  : 22/SSH  5432/PostgreSQL  27017/MongoDB
+```
+
+### 5 — Vérification automatique des services
+
+Pour chaque hôte découvert, lance un scan `nmap -sV -O` + scripts NSE ciblés sur ses ports ouverts uniquement, puis des checks complémentaires en bash/curl.
+
+| Service | Ce qui est vérifié |
+|---------|-------------------|
+| **OS** | Fingerprinting (`-O --osscan-guess`) |
+| **SSH** | Version exacte, SSH host key (fingerprint ECDSA/ED25519) |
+| **FTP** | Login anonyme autorisé (`ftp-anon`) |
+| **DNS** | Récursion ouverte (`dns-recursion`) |
+| **SMB** | Partages anonymes, signing désactivé, **EternalBlue** (`smb-vuln-ms17-010`) |
+| **LDAP** | rootDSE accessible sans auth (`ldap-rootdse`) |
+| **MSSQL** | Informations serveur, password vide (`ms-sql-empty-password`) |
+| **NFS** | Exports listables sans auth (`nfs-showmount`, `nfs-ls`) |
+| **MySQL / MariaDB** | Informations serveur, connexion sans mot de passe (`mysql-empty-password`) |
+| **PostgreSQL** | Tentative de connexion avec creds par défaut (`postgres/postgres`) |
+| **RDP** | Niveau de chiffrement (`rdp-enum-encryption`) |
+| **VNC** | Version, authentification requise ou non (`vnc-info`) |
+| **Redis** | `PING` sans auth → si positif : `INFO server` (version, OS, port) |
+| **Elasticsearch** | GET `/` sans auth → cluster name, version, **liste des index** |
+| **MongoDB** | Accès sans auth + liste des bases de données (`mongodb-databases`) |
+| **Memcached** | Commande `stats` sans auth → infos serveur |
+| **RabbitMQ** | Management UI sur port 15672 avec `guest:guest` |
+| **S3 / MinIO** | Endpoint S3-compatible (ports 9000/9001), **liste des buckets** si public |
+| **Git natif** | Protocole git sur port 9418 |
+| **Git HTTP/S** | `/.git/HEAD` exposé, détection GitLab / Gitea / Gogs / GitHub Enterprise |
 
 ---
 
 ## Technologies utilisées
 
-| Composant | Outil | Obligatoire | Rôle |
-|-----------|-------|-------------|------|
-| **Réseau** | `ip` | ✅ OUI | Détection interface, routes, ARP cache |
-| **ICMP** | `ping` | ✅ OUI | Ping sweep |
-| **Timing** | `timeout` | ✅ OUI | Limiter les connexions stagnantes |
-| **Shell** | `bash` ≥ 4 | ✅ OUI | `/dev/tcp` pour TCP connect-scan |
-| **Utilitaires** | `awk`, `shuf`, `mktemp`, `sort` | ✅ OUI | Traitement de texte, randomisation |
-| **Traçage** | `traceroute` | ❌ OPT | Découverte de routeurs intermédiaires |
-| **Scan ARP avancé** | `arp-scan` | ❌ OPT | Vrai scan L2 raw (meilleur que TCP provoke) |
-| **Scan ports furtif** | `nmap` | ❌ OPT | SYN scan (`-sS`), fragmentation, stealth |
-
-### Pourquoi pas de dépendances obligatoires ?
-
-- **`ip`** + **`ping`** : socles de tout discovery réseau Unix
-- **`bash` 5+ `/dev/tcp`** : permet TCP connect-scan **sans nmap** (sinon fallback complet)
-- **`arp-scan` / `nmap` optionnels** : utilisés automatiquement s'ils existent, sinon implémentation bash pure
+| Outil | Obligatoire | Rôle |
+|-------|-------------|------|
+| `bash` ≥ 4 | ✅ | Shell, `/dev/tcp` pour checks bidirectionnels |
+| `nmap` | ✅ | Scan SYN furtif, NSE scripts, OS/version detection |
+| `ip` | ✅ | Détection interface, routes, cache ARP |
+| `ping` | ✅ | Ping sweep ICMP |
+| `awk`, `sort`, `mktemp` | ✅ | Traitement texte, parsing nmap |
+| `curl` | ❌ opt | Checks HTTP (Git, S3, Elasticsearch) — fallback `/dev/tcp` sinon |
+| `nc` (netcat) | ❌ opt | Checks TCP (Redis, Memcached) — fallback `/dev/tcp` sinon |
+| `arp-scan` | ❌ opt | Scan ARP raw natif (meilleur que TCP provoke) |
+| `traceroute` | ❌ opt | Découverte de routeurs intermédiaires |
 
 ---
 
-## Installation & prérequis
+## Prérequis & installation
 
-### Prérequis minimaux (tout OS Linux moderne)
+### Obligatoires
 
 ```bash
-# Vérifier que tu as bash ≥ 4 et ip/ping
-bash --version      # → bash 4.X ou 5.X
-command -v ip       # → /usr/bin/ip (présent par défaut)
-command -v ping     # → /bin/ping (présent par défaut)
+sudo apt install nmap        # Debian / Ubuntu
+sudo yum install nmap        # RedHat / CentOS
+apk add nmap                 # Alpine
 ```
 
-### (Optionnel) Pour meilleure furtivité : installer nmap + arp-scan
+### Recommandés (amélioration des checks)
 
 ```bash
-# Debian / Ubuntu
-sudo apt install nmap arp-scan
-
-# RedHat / CentOS
-sudo yum install nmap arp-scan
-
-# Alpine
-apk add nmap arp-scan
+sudo apt install curl netcat-openbsd arp-scan traceroute
 ```
 
-### Télécharger le script
+### Mise en place du script
 
 ```bash
-# Si déjà présent à ~/netdiscover.sh
-chmod +x ~/netdiscover.sh
+chmod +x netdiscover.sh
 
-# Ou cloner/copier depuis source
-cp netdiscover.sh /usr/local/bin/  # (optionnel)
-chmod +x /usr/local/bin/netdiscover.sh
+# Optionnel : accessible depuis partout
+sudo cp netdiscover.sh /usr/local/bin/
 ```
 
 ---
 
 ## Usage
 
-### Mode par défaut (aucune option)
-
-Lancement complet : découverte + tous les ports, non-interactif (idéal pour scripts).
+### Lancement standard (aucune option)
 
 ```bash
-./netdiscover.sh
+sudo ./netdiscover.sh
 ```
 
-**Résultat attendu** :
+Détecte automatiquement l'interface et le réseau, puis enchaîne les 5 phases sans aucune interaction.
+
+### Options disponibles
+
 ```
-=== Configuration ===
-[*] Interface      : eth0
-[*] IP locale      : 192.168.1.10
-[*] Reseau cible   : 192.168.1.0/24  (254 hotes)
-...
-=== Decouverte L2 (ARP) ===
-[+] Hotes presents en L2 (ARP) : 12
-=== Ping sweep (ICMP) ===
-[+] Hotes qui repondent au ping : 10
-=== Comparatif : visibles (ARP) vs joignables (ping) ===
-192.168.1.1      aa:bb:cc:dd:ee:ff  oui      oui
-192.168.1.50     —                 oui      non    <- visible L2 mais ne ping pas (ICMP filtre ?)
-...
-=== Scan de ports ===
-[scan] 192.168.1.1
-  192.168.1.1      port 22     ouvert
-  192.168.1.1      port 80     ouvert
-...
+sudo ./netdiscover.sh [options]
+
+  -i IFACE    Interface réseau (défaut : détection automatique)
+  -n CIDR     Réseau cible, ex: 10.0.0.0/24 (défaut : auto)
+  -h          Affiche l'aide
 ```
 
-### Exemples spécifiques
+### Exemples
 
-#### Découverte seule (pas de scan de ports)
 ```bash
-./netdiscover.sh --no-ports
-```
+# Réseau auto-détecté
+sudo ./netdiscover.sh
 
-#### Scanner un réseau spécifique
-```bash
-./netdiscover.sh -n 10.0.0.0/24 -i eth1
-```
+# Réseau spécifique sur une interface précise
+sudo ./netdiscover.sh -n 10.10.10.0/24 -i eth1
 
-#### Scan ports seulement sur certains ports
-```bash
-./netdiscover.sh -P 22,80,443,8080,3306
-```
-
-#### Scanner aussi les hôtes qui ne répondent pas (comme nmap `-Pn`)
-```bash
-./netdiscover.sh --pn
-```
-
-#### Scanner avec délai/jitter pour plus de furtivité
-```bash
-./netdiscover.sh -d 500 -j 32 -t 2
-# -d 500 : 500ms+jitter entre chaque probe
-# -j 32  : moins de parallélisme (stealth)
-# -t 2   : timeout 2s (plus tolérant)
-```
-
-#### Coupler dans un autre script (capture output)
-```bash
-#!/bin/bash
-output=$(/path/to/netdiscover.sh 2>&1)
-echo "$output" | grep -E "port.*ouvert" | awk '{print $1}'  # liste IP avec ports ouverts
-```
-
----
-
-## Options complètes
-
-```
-./netdiscover.sh [options]
-
-  -i IFACE      Interface réseau (défaut : détection auto via route)
-  -n CIDR       Réseau cible, ex 192.168.1.0/24 (défaut : auto depuis interface)
-  
-  -P LISTE      Ports à scanner :
-                  "all"           → 1-65535 (défaut)
-                  "top"           → ports courants (21,22,80,443,...)
-                  "22,80,443"     → liste explicite
-                  "1-1024"        → plage
-  
-  -p            Activer scan de ports (défaut : oui)
-  --no-ports    Désactiver scan de ports (découverte seule)
-  
-  --pn          Scanner aussi les hôtes "muets" (no ping, équiv nmap -Pn)
-  
-  -d MS         Délai de base entre probes de port en ms (défaut 0)
-                Du jitter aléatoire est ajouté pour plus de furtivité
-  
-  -t SEC        Timeout de connexion en secondes (défaut 1)
-  
-  -j N          Parallélisme hôtes ET ports (défaut 64)
-                Moins = plus furtif mais plus lent
-                Plus = plus rapide mais plus bruyant
-  
-  --no-ping     Ne pas faire le ping sweep
-  --no-arp      Ne pas faire la découverte ARP/L2
-  --force       (défaut) : ignore les prompts de confirmation
-  
-  -h            Affiche cette aide
+# Couplé dans un autre script
+output=$(sudo /path/to/netdiscover.sh 2>&1)
+echo "$output" | grep "ELASTICSEARCH sans auth"
+echo "$output" | grep "REDIS sans auth"
+echo "$output" | grep "mongodb-databases"
 ```
 
 ---
 
 ## Détails techniques
 
-### ARP Discovery (L2)
+### ARP Discovery
 
-#### Avec `arp-scan` (idéal)
-- Envoie des requêtes ARP raw à la couche 2 (pas dépendant d'ICMP)
-- Détecte **tous les hôtes qui répondent au protocole ARP**, même ceux qui filtrent l'ICMP
-- Rapide et vrai
+#### Avec `arp-scan`
+Envoie des requêtes ARP broadcast raw à la couche 2.
+Détecte **tous** les hôtes présents, même ceux qui filtrent l'ICMP (firewalls).
 
-#### Sans `arp-scan` (fallback bash)
-- Provoque la résolution ARP via tentatives TCP connect à ports courants (80, 443, 22, 445)
-- Le noyau **doit** résoudre le MAC avant d'envoyer le SYN (indépendant de la réponse IP)
-- Lit ensuite `ip neigh show` pour récupérer les MACs découverts
-- **Avantage** : fonctionne même sur hôtes firewallés (ICMP bloqué)
-- **Désavantage** : plus lent que vrai ARP scan
+#### Sans `arp-scan` (fallback)
+Tente une connexion TCP sur les ports 80/443/22/445 de chaque IP.
+Le noyau Linux doit résoudre le MAC (ARP) **avant** d'envoyer le SYN,
+indépendamment de la réponse de l'hôte. Les MACs apparaissent ensuite dans `ip neigh`.
 
-### Ping Sweep (ICMP)
+### SSH Host Key
 
-```bash
-ping -c1 -W1 -n <IP>
+La clé d'hôte SSH est l'identité cryptographique unique d'un serveur.
+Nmap la remonte via le script `ssh-hostkey` :
+
 ```
-- `-c1` : un seul echo
-- `-W1` : timeout 1s
-- Parallélisé jusqu'à `$JOBS` (défaut 64) hôtes en même temps
-
-### Scan de ports
-
-#### Avec `nmap` (furtivité optimale)
-
-**Si root** :
-```bash
-nmap -sS -T2 -f -p- --randomize-hosts <hotes>
-```
-- `-sS` : **SYN scan** (ne complète jamais la connexion TCP) → plus furtif
-- `-f` : fragmente les paquets (anti-IDS)
-- `-T2` : timing "polite" (lent)
-- `-p-` : tous les ports
-
-**Si user normal** :
-```bash
-nmap -sT -T2 --randomize-hosts -p- <hotes>
-```
-- `-sT` : connect-scan (fallback, pas de SYN privé)
-
-#### Sans `nmap` (bash `/dev/tcp`)
-
-```bash
-exec 3<>/dev/tcp/<IP>/<PORT> 2>/dev/null && echo "$PORT"
-```
-- Bête et méchant : ouvre connexion TCP complète
-- **Non furtif** : loggé côté service
-- **Avantage** : aucune dépendance externe
-
-**Optimisations pour la furtivité (bash)** :
-- Ordre aléatoire hôtes (`shuf`)
-- Ordre aléatoire ports (`shuf`)
-- Délai configurable (`-d`) + jitter aléatoire
-- Timeout court (1s défaut)
-- Parallélisation modérée (réduire `-j` = plus lent mais plus discret)
-
----
-
-## Furtivité : comparatif des approches
-
-| Méthode | Discrétion | Rapidité | Dépendance |
-|---------|-----------|----------|-----------|
-| **nmap SYN (-sS)** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | nmap + root |
-| **nmap connect (-sT)** | ⭐⭐⭐ | ⭐⭐⭐ | nmap |
-| **bash /dev/tcp** | ⭐⭐ | ⭐⭐⭐ | bash 4+ (aucun autre) |
-| **arp-scan** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | arp-scan (optionnel) |
-
-### Recommandations
-
-- **Pentest interne / lab** : `nmap -sS` en root → furtivité + rapidité
-- **Environnement restreint** : bash `/dev/tcp` + `-d 1000 -j 16` → lent mais sans dépendance
-- **Découverte rapide** : bash `/dev/tcp` + `-j 100` → bruyant mais rapide
-- **Éviter la détection IDS** : `nmap -sS -f -T1 --spoof-mac` (plus les options du script)
-
----
-
-## Couplage dans un autre script
-
-```bash
-#!/bin/bash
-# Exemple : lancer netdiscover et récupérer les résultats
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_NET="${1:-192.168.1.0/24}"
-
-# Lancer le scan (non-interactif, pas de couleurs si piped)
-output=$("$SCRIPT_DIR/netdiscover.sh" -n "$TARGET_NET" 2>&1)
-
-# Extraire les ports ouverts
-echo "=== Ports ouverts détectés ==="
-echo "$output" | grep "ouvert" | awk '{print $1, $3}' | sort -u
-
-# Ou : extraire les adresses IP des hôtes découverts
-echo "=== Hôtes découverts ==="
-echo "$output" | grep -E "^\d+\.\d+\.\d+\.\d+" | awk '{print $1}' | sort -u
-
-# Ou : check si un port spécifique est ouvert
-if echo "$output" | grep -q "22.*ouvert"; then
-  echo "SSH (port 22) ouvert !"
-fi
+22/tcp open  ssh    OpenSSH 9.2p1 Debian
+| ssh-hostkey:
+|   256 a02adbfa68f60c0c0ca069826e17b033 (ECDSA)
+|_  256 56ee4673ccf8655a640de5bb1952444e (ED25519)
 ```
 
-### Sortie non-colorée quand piped
+**Utilité en pentest :**
+- **Identifier une machine de manière unique** même si elle change d'IP
+- **Détecter des VMs clonées** depuis la même image (même fingerprint = clé non regénérée)
+- **Corréler entre réseaux** : même fingerprint trouvée sur deux sous-réseaux différents = même machine accessible depuis deux segments
+- **Confirmer la version SSH** pour rechercher des CVE associées
 
-Le script détecte automatiquement si stdout est un terminal :
+### Scan SYN furtif
+
 ```bash
-[[ -t 1 ]] && export COLORS=1 || export COLORS=0
+nmap -sS -T2 --min-rate 50 --randomize-hosts -p <ports> <hotes>
 ```
 
-Donc `./netdiscover.sh | grep ...` donne du texte brut, facile à parser.
+- `-sS` : SYN scan — envoie un SYN, lit la réponse (SYN-ACK = ouvert, RST = fermé), ne complète jamais la connexion TCP → non loggé par les services applicatifs
+- `-T2` : timing "Polite" — lent, réduit le bruit réseau
+- `--min-rate 50` : maximum 50 paquets/seconde
+- `--randomize-hosts` : ordre aléatoire des cibles
 
----
+### Scan custom IP-by-IP
 
-## Limitations connues
+Même ports, même flags nmap, mais lancé individuellement par hôte.
+Certains IDS/firewalls ne déclenchent que sur les scans de masse (seuil de connexions simultanées).
+Un scan IP par IP peut passer sous le radar dans ces cas.
+Seuls les ports trouvés **en plus** du scan de masse sont reportés.
 
-1. **Pas de protocoles autres que TCP** : HTTP, DNS, SNMP scans nécessitent nmap ou outils spécialisés
-2. **Hôtes filtrés → lents** : si un hôte drop tous les paquets (no RST), chaque port attend le timeout complet
-3. **Pas de UDP** : seul TCP connect-scan / nmap SYN
-4. **Pas de chemin réseau inversé** : pas de scan de sous-réseaux non-contigus
-5. **Pas d'OS fingerprinting** : seul port knocking
+### Vérification des services sans creds
+
+Plusieurs services sont souvent déployés sans authentification :
+
+| Service | Vecteur de check |
+|---------|-----------------|
+| Redis | `PING` TCP → `+PONG` = pas d'auth |
+| Elasticsearch | `GET /` HTTP → JSON avec `cluster_name` = pas d'auth |
+| MongoDB | NSE `mongodb-databases` → liste DB = pas d'auth |
+| Memcached | `stats` TCP → réponse STAT = pas d'auth |
+| FTP | NSE `ftp-anon` → login `anonymous:anonymous` |
+| MySQL | NSE `mysql-empty-password` → connexion root sans password |
+| RabbitMQ | `GET /api/overview` avec `guest:guest` |
 
 ---
 
 ## Exemples d'output
 
-### Avec hôtes détectés
-
 ```
-=== Comparatif : visibles (ARP) vs joignables (ping) ===
-IP               MAC                 ARP      PING    
-------------------------------------------------------------
-192.168.1.1      bc:24:11:6b:1b:e3   oui      oui
-192.168.1.50     aa:bb:cc:dd:ee:ff   oui      non    <- visible L2 mais ne ping pas (ICMP filtre ?)
-192.168.1.100    bb:cc:dd:ee:ff:aa   non      oui    <- ping only, ARP pas resolu (timeout provoke)
+=== Recapitulatif des ports ouverts ===
+  192.168.1.1   : 22/SSH  53/DNS  80/HTTP  443/HTTPS
+  192.168.1.50  : 22/SSH  3306/MySQL  27017/MongoDB
+  192.168.1.100 : 22/SSH  445/SMB  6379/Redis
 
-[+] Total joignables : 3  | ARP : 2  | Ping : 3
-```
+=== Verification des services ===
 
-### Scan de ports
+┌─[ 192.168.1.100 ]
+  22/tcp  open  ssh    OpenSSH 9.2p1 Debian
+  445/tcp open  smb    Samba 4.x
+  | smb-enum-shares:
+  |   SHARE  backup  READ, WRITE  <- partage accessible !
+  6379/tcp open  redis  Redis 7.0.5
+  [!] REDIS sans auth !
+    redis_version:7.0.5
+    os:Linux 5.15.0 x86_64
+    tcp_port:6379
 
-```
-=== Scan de ports ===
-[*] Scan des 3 hotes decouverts.
-[*] nmap absent -> connect-scan bash (/dev/tcp).
-[*] Ports a tester par hote : 65535  | timeout 1s | parallelisme 64 | delai 0ms+jitter
-[scan] 192.168.1.1
-  192.168.1.1      port 22     ouvert
-  192.168.1.1      port 80     ouvert
-  192.168.1.1      port 443    ouvert
-[scan] 192.168.1.50
-  192.168.1.50     port 3306   ouvert
-[scan] 192.168.1.100
-  192.168.1.100    (aucun port ouvert)
+┌─[ 192.168.1.50 ]
+  27017/tcp open  mongodb  MongoDB 6.0
+  | mongodb-databases:
+  |   databases: admin, config, local, users_prod
+  [!] MONGODB sans auth ! Bases accessibles.
 ```
 
 ---
 
 ## Troubleshooting
 
-### Le script dit "Aucune interface detectee"
+### "Doit etre lance en root/sudo"
 ```bash
-# Vérifier les interfaces disponibles
-ip addr show
-
-# Spécifier l'interface manuellement
-./netdiscover.sh -i eth0 -n 192.168.1.0/24
+sudo ./netdiscover.sh
 ```
 
-### Pas d'hôtes trouvés
-- Vérifier que le réseau est correct : `ip route show`
-- Tester ping manuel : `ping -c1 192.168.1.1`
-- Le réseau peut être vide ou isolé
+### "nmap obligatoire"
+```bash
+sudo apt install nmap
+```
 
-### Scan de ports très lent
-- Réduire la plage : `-P 1-1024` au lieu de `all`
-- Augmenter parallelisme : `-j 200`
-- Réduire timeout : `-t 0.5` (risque de faux négatifs)
+### Aucun hôte trouvé
+```bash
+# Vérifier l'interface et la route
+ip addr show
+ip route show
 
-### "Grande plage : N hotes" sans demande de confirmation
-- C'est normal en mode non-interactif (stdin non-tty)
-- Le script procède d'office (`--force` défaut)
+# Forcer le réseau manuellement
+sudo ./netdiscover.sh -n 192.168.1.0/24 -i eth0
+```
 
----
-
-## License & notes de sécurité
-
-Ce script est fourni à titre éducatif et de test réseau interne.
-
-⚠️ **Utilisation responsable** : ne scanner que des réseaux sur lesquels tu as autorisation. Les scans de ports non-autorisés peuvent être illégaux dans certaines juridictions.
+### Scan de services très lent
+Les checks de services relancent nmap par IP avec `-sV -O` et les scripts NSE.
+Sur de grandes plages avec beaucoup d'hôtes, c'est normal que ça prenne du temps.
 
 ---
 
-## Contacts & contributions
+## Notes de sécurité
 
-Questions / bugs → voir code source ou ouvrir une issue.
+Ce script est fourni à titre éducatif et pour les tests réseau internes autorisés.
+
+⚠️ **Utilisation responsable** : ne scanner que des réseaux sur lesquels tu as une autorisation explicite. Les scans de ports non-autorisés sont illégaux dans de nombreuses juridictions.
