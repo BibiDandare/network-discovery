@@ -266,10 +266,10 @@ done
 # ====================================================================
 # 4. SCAN UDP (services courants exposes en UDP)
 # ====================================================================
-# DNS, SNMP, NFS/RPC, NetBIOS, NTP, DHCP, TFTP, Kerberos, IKE/VPN...
-UDP_PIVOT="53,67,69,88,111,123,137,138,161,389,500,514,2049,5353,4500"
+# DNS uniquement en UDP (moins de bruit, port 53 suffisant pour identifier les resolvers)
+UDP_PIVOT="53"
 
-hdr "Scan UDP (services courants)"
+hdr "Scan UDP (DNS/53)"
 info "Ports : $UDP_PIVOT"
 echo
 
@@ -397,23 +397,15 @@ for ip in "${RECAP_IPS[@]}"; do
 
   printf '\n%s┌─[ %s ]%s\n' "$C_B$C_CYN" "$ip" "$C_RST"
 
-  # --- Ports TCP en vert ---
-  if [[ ${#ip_tcp[@]} -gt 0 ]]; then
-    line=""
-    for p in "${ip_tcp[@]}"; do
-      line+="${C_GRN}${p}${C_RST}${C_DIM}/TCP/${SVC[$p]:-?}${C_RST}  "
-    done
-    printf '  %sTCP%s : %b\n' "$C_B" "$C_RST" "$line"
-  fi
-
-  # --- Ports UDP en vert ---
-  if [[ ${#ip_udp[@]} -gt 0 ]]; then
-    line=""
-    for p in "${ip_udp[@]}"; do
-      line+="${C_GRN}${p}${C_RST}${C_DIM}/UDP/${SVC[$p]:-?}${C_RST}  "
-    done
-    printf '  %sUDP%s : %b\n' "$C_B" "$C_RST" "$line"
-  fi
+  # --- Ports ouverts (un par ligne, en vert) ---
+  for p in "${ip_tcp[@]}"; do
+    printf '  %s%-6s%s tcp   %s%-16s%s  port ouvert\n' \
+      "$C_GRN" "$p" "$C_RST" "$C_DIM" "(${SVC[$p]:-?})" "$C_RST"
+  done
+  for p in "${ip_udp[@]}"; do
+    printf '  %s%-6s%s udp   %s%-16s%s  port ouvert\n' \
+      "$C_GRN" "$p" "$C_RST" "$C_DIM" "(${SVC[$p]:-?})" "$C_RST"
+  done
   echo
 
   # --- Construction des specs de ports et scripts NSE ---
