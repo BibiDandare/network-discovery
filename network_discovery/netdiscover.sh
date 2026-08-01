@@ -5,8 +5,12 @@
 # Decouverte : ARP scan + ping sweep + comparatif
 # Autres reseaux : routes, voisins ARP, traceroute
 # Scan ports : nmap -sS (SYN furtif) sur ports sensibles/pivoting
+#              si nmap absent -> fallback connect-scan (nc, ou bash /dev/tcp
+#              si nc absent). Pas d'install auto, pas de -sV/-O/NSE en fallback.
 #
-# Necessite : bash 4+, ip, ping, timeout, nmap (obligatoire), root/sudo
+# Necessite : bash 4+, ip, ping, timeout, root/sudo
+#   nmap recommande (scan SYN + -sV/-O/NSE). Sans nmap : scan TCP connect
+#   degrade via nc (ou bash /dev/tcp), sans version/OS/NSE, UDP non teste.
 #
 # Usage : sudo ./netdiscover.sh [options]
 #   -i IFACE     Interface (defaut : auto)
@@ -31,9 +35,19 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # ----------------------------- checks ---------------------------------
 [[ $EUID -ne 0 ]] && { err "Doit etre lance en root/sudo."; exit 1; }
-have nmap || { err "nmap obligatoire. sudo apt install nmap"; exit 1; }
 have ip || { err "'ip' introuvable."; exit 1; }
 have ping || { err "'ping' introuvable."; exit 1; }
+
+if have nmap; then
+  HAVE_NMAP=1
+else
+  HAVE_NMAP=0
+  if have nc; then
+    warn "nmap absent -> fallback scan de ports via nc (pas de -sV/-O/NSE, pas d'UDP)."
+  else
+    warn "nmap et nc absents -> fallback scan de ports via bash /dev/tcp (plus lent, TCP connect seulement)."
+  fi
+fi
 
 # ----------------------------- defaults & args -------------------------
 IFACE=""; CIDR=""
@@ -197,71 +211,108 @@ if (( ${#ALIVE[@]} == 0 )); then
   exit 0
 fi
 
-# ----------------------------------------------------------------
-# 3a. Scan nmap de masse (SYN furtif)
-#     -> sauvegarde output greppable pour comparaison avec scan custom
-# ----------------------------------------------------------------
-hdr "Scan nmap de masse (SYN furtif)"
-info "Hotes : ${#SORTED[@]}  |  Ports : $PORTS_PIVOT"
-echo
+declare -A NMAP_OPEN CUSTOM_OPEN
 
-NMAP_NORM=$(mktemp); NMAP_GREP=$(mktemp)
-nmap -sS -T2 --min-rate 50 --randomize-hosts \
-     -p "$PORTS_PIVOT" "${SORTED[@]}" \
-     -oN "$NMAP_NORM" -oG "$NMAP_GREP" >/dev/null
-cat "$NMAP_NORM"
-rm -f "$NMAP_NORM"
+if (( HAVE_NMAP )); then
+  # ----------------------------------------------------------------
+  # 3a. Scan nmap de masse (SYN furtif)
+  #     -> sauvegarde output greppable pour comparaison avec scan custom
+  # ----------------------------------------------------------------
+  hdr "Scan nmap de masse (SYN furtif)"
+  info "Hotes : ${#SORTED[@]}  |  Ports : $PORTS_PIVOT"
+  echo
 
-# Parser les ports ouverts du scan de masse pour comparaison
-declare -A NMAP_OPEN
-while IFS= read -r key; do
-  NMAP_OPEN["$key"]=1
-done < <(grep "^Host:" "$NMAP_GREP" | awk '{
-  ip = $2
-  for (i = 1; i <= NF; i++) {
-    if ($i ~ /\/open\/tcp/) {
-      split($i, parts, "/")
-      gsub(/,/, "", parts[1])
-      print ip ":" parts[1]
+  NMAP_NORM=$(mktemp); NMAP_GREP=$(mktemp)
+  nmap -sS -T2 --min-rate 50 --randomize-hosts \
+       -p "$PORTS_PIVOT" "${SORTED[@]}" \
+       -oN "$NMAP_NORM" -oG "$NMAP_GREP" >/dev/null
+  cat "$NMAP_NORM"
+  rm -f "$NMAP_NORM"
+
+  # Parser les ports ouverts du scan de masse pour comparaison
+  while IFS= read -r key; do
+    NMAP_OPEN["$key"]=1
+  done < <(grep "^Host:" "$NMAP_GREP" | awk '{
+    ip = $2
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /\/open\/tcp/) {
+        split($i, parts, "/")
+        gsub(/,/, "", parts[1])
+        print ip ":" parts[1]
+      }
     }
-  }
-}')
-rm -f "$NMAP_GREP"
+  }')
+  rm -f "$NMAP_GREP"
 
-# ----------------------------------------------------------------
-# 3b. Scan custom IP-by-IP
-#     Scanne chaque hote individuellement : peut contourner certains
-#     IDS/firewalls qui detectent uniquement les scans de masse,
-#     et trouver des ports que le scan de masse aurait rates.
-# ----------------------------------------------------------------
-hdr "Scan custom IP-by-IP (detection complementaire)"
-info "Scan individuel de ${#SORTED[@]} hotes sur les memes ports..."
-echo
+  # ----------------------------------------------------------------
+  # 3b. Scan custom IP-by-IP
+  #     Scanne chaque hote individuellement : peut contourner certains
+  #     IDS/firewalls qui detectent uniquement les scans de masse,
+  #     et trouver des ports que le scan de masse aurait rates.
+  # ----------------------------------------------------------------
+  hdr "Scan custom IP-by-IP (detection complementaire)"
+  info "Scan individuel de ${#SORTED[@]} hotes sur les memes ports..."
+  echo
 
-declare -A CUSTOM_OPEN
-CIDR_RANGE="$(int2ip $netaddr)/$PREFIX"
+  for ip in "${SORTED[@]}"; do
+    while IFS= read -r portline; do
+      port=$(echo "$portline" | awk -F'/' '{gsub(/ /,"",$1); print $1}')
+      [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && CUSTOM_OPEN["${ip}:${port}"]=1
+    done < <(nmap -sS -p "$PORTS_PIVOT" "$ip" 2>/dev/null | grep "^[0-9].*open")
+  done
 
-for ip in "${SORTED[@]}"; do
-  while IFS= read -r portline; do
-    port=$(echo "$portline" | awk -F'/' '{gsub(/ /,"",$1); print $1}')
-    [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && CUSTOM_OPEN["${ip}:${port}"]=1
-  done < <(nmap -sS -p "$PORTS_PIVOT" "$ip" 2>/dev/null | grep "^[0-9].*open")
-done
-
-# Comparer : afficher seulement ce que custom a trouve en plus
-EXTRAS=0
-for key in $(printf '%s\n' "${!CUSTOM_OPEN[@]}" | sort -t: -k1,1 -k2,2n); do
-  if [[ -z "${NMAP_OPEN[$key]:-}" ]]; then
-    cip="${key%%:*}"; cport="${key##*:}"
-    if (( EXTRAS == 0 )); then
-      printf '%s[+] Nouveaux resultats trouves par le scan custom :%s\n' "$C_YEL" "$C_RST"
+  # Comparer : afficher seulement ce que custom a trouve en plus
+  EXTRAS=0
+  for key in $(printf '%s\n' "${!CUSTOM_OPEN[@]}" | sort -t: -k1,1 -k2,2n); do
+    if [[ -z "${NMAP_OPEN[$key]:-}" ]]; then
+      cip="${key%%:*}"; cport="${key##*:}"
+      if (( EXTRAS == 0 )); then
+        printf '%s[+] Nouveaux resultats trouves par le scan custom :%s\n' "$C_YEL" "$C_RST"
+      fi
+      printf '  %s%-16s%s port %s%-6s%s ouvert %s(non detecte par le scan de masse)%s\n' \
+        "$C_B" "$cip" "$C_RST" "$C_GRN" "$cport" "$C_RST" "$C_DIM" "$C_RST"
+      EXTRAS=1
     fi
-    printf '  %s%-16s%s port %s%-6s%s ouvert %s(non detecte par le scan de masse)%s\n' \
-      "$C_B" "$cip" "$C_RST" "$C_GRN" "$cport" "$C_RST" "$C_DIM" "$C_RST"
-    EXTRAS=1
-  fi
-done
-(( EXTRAS == 0 )) && info "Aucun port supplementaire trouve par le scan custom."
+  done
+  (( EXTRAS == 0 )) && info "Aucun port supplementaire trouve par le scan custom."
+
+else
+  # ----------------------------------------------------------------
+  # 3-fallback. nmap absent : connect-scan via nc (ou bash /dev/tcp)
+  #     Pas de distinction mass/custom (meme technique) : un seul passage.
+  # ----------------------------------------------------------------
+  hdr "Scan de ports (fallback, nmap absent)"
+  IFS=',' read -ra _pivot_ports <<< "$PORTS_PIVOT"
+  info "Hotes : ${#SORTED[@]}  |  Ports : $PORTS_PIVOT"
+  info "Methode : $(have nc && echo 'nc -z (TCP connect)' || echo 'bash /dev/tcp (TCP connect)')"
+  echo
+
+  fallback_check_target() {  # "$ip:$port" -> "OPEN ip:port" si ouvert
+    local target="$1" ip="${1%%:*}" port="${1##*:}"
+    if have nc; then
+      nc -z -w1 "$ip" "$port" >/dev/null 2>&1 && echo "OPEN $ip:$port"
+    else
+      timeout 1 bash -c "exec 3<>/dev/tcp/$ip/$port" 2>/dev/null && { exec 3>&- 2>/dev/null; echo "OPEN $ip:$port"; }
+    fi
+    return 0
+  }
+
+  _targets_ports=()
+  for ip in "${SORTED[@]}"; do
+    for p in "${_pivot_ports[@]}"; do _targets_ports+=("${ip}:${p}"); done
+  done
+
+  while read -r tag key; do
+    [[ "$tag" == OPEN ]] && NMAP_OPEN["$key"]=1
+  done < <(printf '%s\n' "${_targets_ports[@]}" | run_with_jobs fallback_check_target)
+  unset _targets_ports _pivot_ports
+
+  ok "Ports TCP ouverts trouves : ${#NMAP_OPEN[@]}"
+  for key in $(printf '%s\n' "${!NMAP_OPEN[@]}" | sort -t: -k1,1 -k2,2n); do
+    cip="${key%%:*}"; cport="${key##*:}"
+    printf '  %s%-16s%s port %s%-6s%s ouvert\n' "$C_B" "$cip" "$C_RST" "$C_GRN" "$cport" "$C_RST"
+  done
+fi
 
 # ====================================================================
 # 4. SCAN UDP (services courants exposes en UDP)
@@ -273,30 +324,43 @@ hdr "Scan UDP (DNS/53)"
 info "Ports : $UDP_PIVOT"
 echo
 
-UDP_NORM=$(mktemp); UDP_GREP=$(mktemp)
-nmap -sU -T2 --min-rate 50 \
-     -p "$UDP_PIVOT" "${SORTED[@]}" \
-     -oN "$UDP_NORM" -oG "$UDP_GREP" >/dev/null 2>&1
-cat "$UDP_NORM"
-rm -f "$UDP_NORM"
-
-# Parser les ports UDP open ou open|filtered (les deux meritent attention)
 declare -A UDP_PORTS_BY_IP
-while IFS= read -r key; do
-  cip="${key%%:*}"; cport="${key##*:}"
-  UDP_PORTS_BY_IP["$cip"]+=" $cport"
-done < <(grep "^Host:" "$UDP_GREP" | awk '{
-  ip = $2
-  for (i=1; i<=NF; i++) {
-    if ($i ~ /open.*\/udp/) {
-      split($i, parts, "/")
-      gsub(/,/, "", parts[1])
-      gsub(/^[[:space:]]+/, "", parts[1])
-      if (parts[1] ~ /^[0-9]+$/) print ip ":" parts[1]
+
+if (( HAVE_NMAP )); then
+  UDP_NORM=$(mktemp); UDP_GREP=$(mktemp)
+  nmap -sU -T2 --min-rate 50 \
+       -p "$UDP_PIVOT" "${SORTED[@]}" \
+       -oN "$UDP_NORM" -oG "$UDP_GREP" >/dev/null 2>&1
+  cat "$UDP_NORM"
+  rm -f "$UDP_NORM"
+
+  # Parser les ports UDP open ou open|filtered (les deux meritent attention)
+  while IFS= read -r key; do
+    cip="${key%%:*}"; cport="${key##*:}"
+    UDP_PORTS_BY_IP["$cip"]+=" $cport"
+  done < <(grep "^Host:" "$UDP_GREP" | awk '{
+    ip = $2
+    for (i=1; i<=NF; i++) {
+      if ($i ~ /open.*\/udp/) {
+        split($i, parts, "/")
+        gsub(/,/, "", parts[1])
+        gsub(/^[[:space:]]+/, "", parts[1])
+        if (parts[1] ~ /^[0-9]+$/) print ip ":" parts[1]
+      }
     }
-  }
-}')
-rm -f "$UDP_GREP"
+  }')
+  rm -f "$UDP_GREP"
+elif have nc; then
+  warn "nmap absent -> sondage UDP/53 via nc (best-effort, peu fiable sans nmap : pas d'ICMP unreachable check)."
+  for ip in "${SORTED[@]}"; do
+    if printf '' | timeout 2 nc -u -w1 "$ip" 53 >/dev/null 2>&1; then
+      UDP_PORTS_BY_IP["$ip"]+=" 53"
+    fi
+  done
+  ok "Hotes UDP/53 potentiellement ouverts : $(printf '%s\n' "${!UDP_PORTS_BY_IP[@]}" | grep -c .)"
+else
+  warn "nmap et nc absents -> scan UDP impossible (bash /dev/udp ne permet pas de detecter un port ouvert de facon fiable). Ignore."
+fi
 
 # ====================================================================
 # 5. RECAPITULATIF + VERIFICATION DES SERVICES (par IP, fusionnes)
@@ -448,12 +512,24 @@ for ip in "${RECAP_IPS[@]}"; do
     scan_flags="-sU";     port_spec="-p ${udp_csv}"
   fi
 
-  nmap_cmd="nmap $scan_flags -sV -O --osscan-guess $port_spec"
-  [[ -n "$scripts" ]] && nmap_cmd+=" --script $scripts"
-  [[ "$scripts" == *"pgsql-brute"* ]] && nmap_cmd+=" --script-args brute.firstonly=true"
-  nmap_cmd+=" $ip"
+  if (( HAVE_NMAP )); then
+    nmap_cmd="nmap $scan_flags -sV -O --osscan-guess $port_spec"
+    [[ -n "$scripts" ]] && nmap_cmd+=" --script $scripts"
+    [[ "$scripts" == *"pgsql-brute"* ]] && nmap_cmd+=" --script-args brute.firstonly=true"
+    nmap_cmd+=" $ip"
 
-  $nmap_cmd 2>/dev/null | grep -v "^$" | sed 's/^/  /'
+    $nmap_cmd 2>/dev/null | grep -v "^$" | sed 's/^/  /'
+  else
+    info "  nmap absent : pas de -sV/-O/NSE. Banner grab basique sur ports TCP :"
+    for p in "${ip_tcp[@]}"; do
+      banner=$(tcp_dialog "$ip" "$p" "" 2 | tr -d '\000' | head -c 200 | tr -c '[:print:]\n' '.')
+      if [[ -n "$banner" ]]; then
+        printf '  [%s] %s\n' "$p" "$(echo "$banner" | head -1)"
+      else
+        printf '  [%s] (pas de banniere, connexion sans envoi de donnees)\n' "$p"
+      fi
+    done
+  fi
 
   # -----------------------------------------------------------------
   # Checks additionnels bash (services non couverts par NSE)

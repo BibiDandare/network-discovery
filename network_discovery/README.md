@@ -4,7 +4,7 @@ Script bash de reconnaissance réseau complet : découverte L2/ICMP, recherche d
 
 Conçu pour être couplé dans un autre script — **aucune option requise**, aucune interaction.
 
-> ⚠️ **Doit être lancé en root/sudo.** `nmap` est une dépendance obligatoire.
+> ⚠️ **Doit être lancé en root/sudo.** `nmap` est recommandé mais plus obligatoire : en son absence, le script bascule automatiquement sur un scan de ports en fallback (`nc`, ou `bash /dev/tcp` si `nc` est aussi absent).
 
 ---
 
@@ -25,19 +25,34 @@ Conçu pour être couplé dans un autre script — **aucune option requise**, au
 - Voisins ARP appartenant à d'autres réseaux (cache noyau)
 - Traceroute vers la passerelle → révèle les routeurs intermédiaires
 
-### 3 — Scan de ports sensibles (double méthode)
+### 3 — Scan de ports sensibles (double méthode, ou fallback sans nmap)
 
-#### 3a — Scan nmap de masse (SYN furtif)
+#### Si `nmap` est présent
+
+##### 3a — Scan nmap de masse (SYN furtif)
 Scan simultané de tous les hôtes découverts sur les ports pivoting :
 ```
 nmap -sS -T2 --min-rate 50 --randomize-hosts -p PORTS <hotes>
 ```
 
-#### 3b — Scan custom IP-by-IP
+##### 3b — Scan custom IP-by-IP
 Scan individuel de chaque hôte sur les mêmes ports.
 Peut détecter des ports manqués par le scan de masse (certains IDS/firewalls
 ne déclenchent qu'au-dessus d'un seuil de ports simultanés).
 Seuls les résultats **supplémentaires** (non détectés par le scan de masse) sont affichés.
+
+#### Si `nmap` est absent — fallback connect-scan
+
+Un seul passage (pas de distinction masse/custom, la technique est identique) :
+- **Avec `nc`** : `nc -z -w1 <ip> <port>` sur chaque hôte × chaque port de la liste pivoting, parallélisé (64 jobs max, comme le reste du script).
+- **Sans `nc` non plus** : repli sur `bash /dev/tcp/<ip>/<port>` (TCP connect natif, plus lent, aucune dépendance externe).
+
+Différences avec le scan nmap :
+- **Full TCP connect**, pas de SYN furtif (connexion complète, donc loggée côté service/appli).
+- Pas de `-sV`/`-O`/scripts NSE en aval (voir section 5) — juste un banner grab basique.
+- Pas de test UDP (le scan UDP/53 est aussi sauté si ni `nmap` ni `nc` ne sont disponibles).
+
+Le script affiche toujours la méthode utilisée en tête de phase (`nmap` / `nc` / `bash /dev/tcp`).
 
 **Ports scannés (23 ports pivoting) :**
 
@@ -68,6 +83,8 @@ Tableau synthétique : une ligne par IP avec tous ses ports ouverts (résultats 
 
 Pour chaque hôte découvert, lance un scan `nmap -sV -O` + scripts NSE ciblés sur ses ports ouverts uniquement, puis des checks complémentaires en bash/curl.
 
+> Sans `nmap` : pas de `-sV`/`-O`/NSE. Le script fait un banner grab basique (`bash /dev/tcp`) sur chaque port TCP ouvert. Les checks bash/curl complémentaires (Redis, Elasticsearch, Memcached, S3, Git, RabbitMQ...) restent actifs dans tous les cas, avec ou sans nmap.
+
 | Service | Ce qui est vérifié |
 |---------|-------------------|
 | **OS** | Fingerprinting (`-O --osscan-guess`) |
@@ -97,13 +114,13 @@ Pour chaque hôte découvert, lance un scan `nmap -sV -O` + scripts NSE ciblés 
 
 | Outil | Obligatoire | Rôle |
 |-------|-------------|------|
-| `bash` ≥ 4 | ✅ | Shell, `/dev/tcp` pour checks bidirectionnels |
-| `nmap` | ✅ | Scan SYN furtif, NSE scripts, OS/version detection |
+| `bash` ≥ 4 | ✅ | Shell, `/dev/tcp` pour checks bidirectionnels et fallback scan |
 | `ip` | ✅ | Détection interface, routes, cache ARP |
 | `ping` | ✅ | Ping sweep ICMP |
 | `awk`, `sort`, `mktemp` | ✅ | Traitement texte, parsing nmap |
+| `nmap` | ❌ opt (recommandé) | Scan SYN furtif, `-sV`/`-O`, NSE scripts, scan UDP — fallback `nc`/`/dev/tcp` sinon (TCP connect only, pas d'UDP, pas de NSE) |
 | `curl` | ❌ opt | Checks HTTP (Git, S3, Elasticsearch) — fallback `/dev/tcp` sinon |
-| `nc` (netcat) | ❌ opt | Checks TCP (Redis, Memcached) — fallback `/dev/tcp` sinon |
+| `nc` (netcat) | ❌ opt | Checks TCP (Redis, Memcached) + scan de ports si `nmap` absent — fallback `/dev/tcp` sinon |
 | `arp-scan` | ❌ opt | Scan ARP raw natif (meilleur que TCP provoke) |
 | `traceroute` | ❌ opt | Découverte de routeurs intermédiaires |
 
@@ -113,17 +130,17 @@ Pour chaque hôte découvert, lance un scan `nmap -sV -O` + scripts NSE ciblés 
 
 ### Obligatoires
 
-```bash
-sudo apt install nmap        # Debian / Ubuntu
-sudo yum install nmap        # RedHat / CentOS
-apk add nmap                 # Alpine
-```
+`bash` ≥ 4, `ip`, `ping` — présents nativement sur toute distro Linux moderne.
 
-### Recommandés (amélioration des checks)
+### Recommandés (nmap pour le scan complet, sinon fallback nc/bash)
 
 ```bash
-sudo apt install curl netcat-openbsd arp-scan traceroute
+sudo apt install nmap curl netcat-openbsd arp-scan traceroute   # Debian / Ubuntu
+sudo yum install nmap curl nc arp-scan traceroute                # RedHat / CentOS
+apk add nmap curl netcat-openbsd arp-scan traceroute              # Alpine
 ```
+
+Sans `nmap` : le scan de ports fonctionne quand même via `nc` (ou `bash /dev/tcp` si `nc` est aussi absent), en mode dégradé (pas de `-sV`/`-O`/NSE/UDP — voir section 3).
 
 ### Mise en place du script
 
@@ -276,7 +293,8 @@ Plusieurs services sont souvent déployés sans authentification :
 sudo ./netdiscover.sh
 ```
 
-### "nmap obligatoire"
+### "nmap absent -> fallback scan de ports via nc / bash /dev/tcp"
+Pas une erreur : le script continue en mode dégradé. Pour retrouver le scan complet (`-sS`, `-sV`, `-O`, NSE, UDP) :
 ```bash
 sudo apt install nmap
 ```
